@@ -66,14 +66,15 @@ A **powerful DNS reconnaissance toolkit** designed for penetration testers, red 
    ```
 
 3. **Clone the Script**:
-   ```bash
-   git clone https://github.com/a-mashhoor/dnsr.git
-   chmod +x dns_recon.sh
-   ```
+
+```bash
+git clone https://github.com/a-mashhoor/dnsr.git
+chmod a+x dnsr.sh
+```
 
 From here, you can use it directly or create a symbolic link to add it to your system's PATH:
 ```bash
-sudo ln -s $(pwd)/dns_recon.sh /usr/local/bin/dns_recon
+sudo ln -s $(pwd)/dnsr.sh /usr/local/bin/dnsr
 ```
 
 ---
@@ -81,22 +82,27 @@ sudo ln -s $(pwd)/dns_recon.sh /usr/local/bin/dns_recon
 ## ⚙️ Usage <a name="usage"></a>
 
 ```bash
-./dns_recon.sh -d DOMAIN [OPTIONS]
+dnsr -d DOMAIN [OPTIONS]
 ```
 
 ### Basic Recon
 ```bash
-./dns_recon.sh -d example.com -o outputfile.json -j
+dnsr -d example.com -o outputfile.json -j
 ```
 
 ### Full Recon with Subdomain Enumeration
 ```bash
-./dns_recon.sh -d example.com -w subdomains.txt -k default -v -o results.txt -j 
+dnsr -d example.com -w subdomains.txt -k default -v -o results.txt -j
 ```
 
 ### Export Results as JSON
 ```bash
-./dns_recon.sh -d example.com -j -o results.json
+dnsr -d example.com -j -o results.json
+```
+### Combine with xargs
+
+```bash
+cat domains.txt | xargs -I {} dnsr -d "{}" -j -o results_dir/"{}"
 ```
 
 ---
@@ -189,4 +195,3 @@ For major changes, please open an issue first to discuss your proposed changes.
 
 > **_"The art of hacking lies not in breaking things, but in understanding them."_**
 ```
-
