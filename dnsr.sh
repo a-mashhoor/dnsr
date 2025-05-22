@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 
 #set -x
 # I initiated this project as a simple DNS handler but it was so much work,(fucking json in shell) enjoy!
@@ -291,6 +291,18 @@ generate_text_output() {
 }
 
 
+function ooo(){
+  if [[ -n "$output_file" ]]; then
+    mkdir -p "$(dirname "$output_file")" || {
+      print "${RED}Error: Failed to create directory for '$output_file'${RESET}"; return 1}
+
+    touch "$output_file" || {
+      print "${RED}Error: Failed to create output file '$output_file'${RESET}"; return 1}
+  fi
+}
+
+
+
 main() {
   local verbose=false output_file="" wordlist="" json_output=false domain="" dkim_selector=""
   local -A opts
@@ -308,6 +320,7 @@ main() {
   fi
 
   output_file=${opts[-o]:-}
+
   wordlist=${opts[-w]:-}
 
   if (( ${+opts[-j]} )); then
@@ -349,6 +362,7 @@ main() {
   email_security_analysis "$domain" "$dkim_selector" "$verbose"
 
   if $json_output; then
+    ooo
     if [[ -n "$output_file" ]]; then
       jq . <<< "$JSON_DATA" > "$output_file"
       print "${GREEN}DNS records saved to $output_file in JSON format${RESET}"
@@ -356,6 +370,7 @@ main() {
       jq . <<< "$JSON_DATA"
     fi
   else
+    ooo
     local use_colors=1
     [[ -n "$output_file" ]] && use_colors=0
     output=$(generate_text_output "$JSON_DATA" "$use_colors" | sed 's/\x1B\[[0-9;]*[JKmsu]//g')
