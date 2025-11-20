@@ -12,7 +12,6 @@ trap 'kill $(jobs -rp) 2>/dev/null' EXIT INT TERM
 set -euo pipefail
 emulate -L zsh
 
-# ---------- deps -------------------------------------------------
 command -v jq   &>/dev/null || { print -u2 "Err: jq required";   exit 1; }
 command -v dig  &>/dev/null || { print -u2 "Err: dig required";  exit 1; }
 
