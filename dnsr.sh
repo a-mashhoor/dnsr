@@ -1,21 +1,23 @@
 #!/usr/bin/env zsh
 
-#set -x
 # I initiated this project as a simple DNS handler but it was so much work,(fucking json in shell) enjoy!
 
 # Enable better zsh options
-setopt extended_glob
-setopt null_glob
-setopt no_unset
+setopt extendedglob dotglob nullglob nounset
 
-# Check if jq is installed
-if $(! command -v jq &> /dev/null) ; then
-  echo "Error: jq is not installed. Please install it first."
-  echo "On Debian/Ubuntu: sudo apt-get install jq"
-  echo "On CentOS/RHEL: sudo yum install jq"
-  echo "On macOS: brew install jq"
+# Check for deps
+
+command -v jq &>/dev/null || {
+  print -u2 -- "Err: jq is required (apt/yum/brew install jq)"
   exit 1
-fi
+}
+
+command -v dig &>/dev/null || {
+  print -u2 -- "Err: dig required"
+  exit 1
+}
+
+
 
 WHITE="\e[1;37m"
 RED="\e[1;31m"
@@ -26,269 +28,217 @@ RESET="\e[0m"
 JSON_TEMP_FILE=$(mktemp)
 JSON_DATA="{}"
 
+
 usage() {
-  echo "Usage: $0 [options]"
-  echo "Options:"
-  echo "  -h            Show this help message"
-  echo "  -v            Enable verbose mode for detailed logs"
-  echo "  -o FILE       Save results to a file (optional)"
-  echo "  -w FILE       Use a wordlist for subdomain enumeration (optional)"
-  echo "  -j            Save results in JSON format (requires -o)"
-  echo "  -d DOMAIN     Specify the target domain (required)"
-  echo "  -k SELECTOR   Specify the DKIM selector for DKIM testing (optional)"
-  echo ""
-  echo "Note: use json output for a cleaner result"
-  echo ""
-  echo "Examples: "
-  echo "  $0 -v -o results.txt -d example.com"
-  echo "  $0 -v -o results.txt -d example.com -w wordlist.txt -k default"
-  echo "  $0 -d example.com -o output.json -j"
+  cat <<EOF
+Usage: $0 [options]
+  -h            Show help
+  -v            Verbose
+  -o FILE       Output file (required for -j)
+  -w FILE       Wordlist for sub-domain brute (parallel --> MAX 200)
+  -j            JSON output (requires -o)
+  -d DOMAIN     Target domain (required)
+  -k SELECTOR   DKIM selector
+Examples:
+  $0 -d example.com
+  $0 -d example.com -j -o out.json
+  $0 -d example.com -w subs.txt -v
+EOF
 }
 
 init_json() {
-  local domain="$1"
-  JSON_DATA=$(/usr/bin/jq -n --arg domain "$domain" '{
-  domain: $domain,
-  dns_records: {},
-  zone_transfer: {},
-  reverse_dns: {},
-  subdomains: {},
-  email_security: {}
-}')
+  JSON_DATA=$(jq -n --arg d "$1" '{domain: $d,dns_records:{},
+  zone_transfer:{},reverse_dns:{},subdomains:{},email_security: {}}')
 }
 
 update_json() {
-  local path="$1"
-  local key="$2"
-  local value="$3"
-
-  if [[ "$value" == "null" ]]; then
-    JSON_DATA=$(/usr/bin/jq --arg key "$key" "$path |= . + {(\$key): null}" <<< "$JSON_DATA")
+  local p=$1 k=$2 v=$3
+  if [[ -z $v ]]; then
+    JSON_DATA=$(jq --arg k "$k" "$p |= . + {(\$k):null}" <<<"$JSON_DATA")
   else
-    JSON_DATA=$(/usr/bin/jq --arg key "$key" --arg value "$value" "$path |= . + {(\$key): \$value}" <<< "$JSON_DATA")
+    JSON_DATA=$(jq --arg k "$k" --arg v "$v" "$p |= . + {(\$k):\$v}" <<<"$JSON_DATA")
   fi
 }
 
-escape_json_string() {
-  local input="$1"
-  input="${input//\\/\\\\}"
-  input="${input//\"/\\\"}"
-  input="${input//$'\n'/\\n}"
-  input="${input//$'\r'/\\r}"
-  input="${input//$'\t'/\\t}"
-  echo "$input"
-}
+
+escape_json_string() { print -nr -- "$1"; }
 
 query_dns_records() {
-  local domain="$1" verbose="$2"
-  local record_types=(A AAAA CNAME MX TXT NS SOA SRV PTR CAA RP HINFO LOC NAPTR TLSA DNAME)
-  local records record_type wildcard
+  local dom=$1 verbose=$2
+  local rtps=(A AAAA CNAME MX TXT NS SOA SRV PTR CAA RP HINFO LOC NAPTR TLSA DNAME)
 
-  if [[ "$verbose" == "true" ]]; then
-    print "${YELLOW}=== Querying DNS Records ===${RESET}"
-  fi
+  local wild=""
+  wild=$(dig "*.$dom" A +short +time=5 +tries=2 2>&1)
+  [[ $? -eq 0 && -n $wild ]] || wild=""
+  update_json '.dns_records' 'wildcard' "$wild"
 
-  if [[ "$verbose" == "true" ]]; then
-    print "${YELLOW}=== cheking for wildcard possibility ===${RESET}"
-  fi
+  for t in $rtps; do
+    $verbose && print "${YELLOW}Querying $t${RESET}"
+    local ans=""
+    ans=$(dig "$dom" "$t" +short +time=5 +tries=2 2>&1 )
 
-  wildcard=$(dig "*.$domain" A +short +time=5 +tries=2 2>&1)
-  if [[ -z "$wildcard" ]]; then
-    update_json ".dns_records" "wildcard" "null"
-  else
-    update_json ".dns_records" "wildcard" "$wildcard"
-  fi
+    # TXT and NS as an array
+    case $t in
+      NS)
+        JSON_DATA=$(jq --argjson a "$(jq -R -s 'split("\n") | map(sub("^\\\"";"") | sub("\\\"$";""))' <<<"$ans")" \
+                       '.dns_records.NS = $a' <<<"$JSON_DATA")
+        continue
+        ;;
+      TXT)
+        JSON_DATA=$(jq --argjson a "$(jq -R -s 'split("\n") | map(sub("^\\\"";"") | sub("\\\"$";""))' <<<"$ans")" \
+                       '.dns_records.TXT = $a' <<<"$JSON_DATA")
+        continue
+        ;;
+    esac
 
-  for record_type in $record_types; do
-    if [[ "$verbose" == "true" ]]; then
-      print "Querying $record_type records for domain: $domain"
-    fi
-
-    records=$(dig "$domain" "$record_type" +short +time=5 +tries=2 2>&1)
-    records=$(escape_json_string "$records")
-
-    if [[ -z "$records" ]]; then
-      update_json ".dns_records" "$record_type" "null"
-    else
-      update_json ".dns_records" "$record_type" "$records"
-    fi
+    update_json '.dns_records' "$t" "$ans"
   done
 }
+
 
 zone_transfer_check() {
-  local domain="$1" verbose="$2"
-  local ns_servers ns axfr
+  local dom=$1 verbose=$2
+  local nss=""
+  nss=($(dig "$dom" NS +short 2>/dev/null))
 
-  if [[ "$verbose" == "true" ]]; then
-    print "${YELLOW}=== Zone Transfer (AXFR) ===${RESET}"
-  fi
-
-  ns_servers=($(dig "$domain" NS +short 2>/dev/null))
-
-  for ns in $ns_servers; do
-    if [[ "$verbose" == "true" ]]; then
-      print "Attempting zone transfer with name server: $ns"
-    fi
-
-    axfr=$(dig axfr "$domain" @"$ns" +short +time=5 2>&1)
-    axfr=$(escape_json_string "$axfr")
-
-    if [[ -z "$axfr" ]]; then
-      update_json ".zone_transfer" "$ns" "null"
-    else
-      update_json ".zone_transfer" "$ns" "$axfr"
-    fi
+  for ns in $nss; do
+    $verbose && print "${YELLOW}AXFR via $ns${RESET}"
+    local z=""
+    z=$(dig axfr "$dom" @"$ns" +short +time=5 2>&1)
+    z=$(escape_json_string "$z")
+    z=$(echo "$z" | sed 's/; //' | sed 's/\.//g')
+    update_json '.zone_transfer' "$ns" "$z"
   done
 }
+
 
 reverse_dns_lookup() {
-  local domain="$1" verbose="$2"
-  local ips ip ptr
-
-  if [[ "$verbose" == "true" ]]; then
-    print "${YELLOW}=== Reverse DNS Lookup (PTR) ===${RESET}"
-  fi
-
-  ips=($(dig "$domain" A +short 2>/dev/null))
-
+  local dom=$1 verbose=$2
+  local ips=""
+  ips=($(dig "$dom" A +short 2>/dev/null))
   for ip in $ips; do
-    if [[ "$verbose" == "true" ]]; then
-      print "Performing reverse DNS lookup for IP: $ip"
-    fi
-
-    ptr=$(dig -x "$ip" +short 2>&1)
-    ptr=$(escape_json_string "$ptr")
-
-    if [[ -z "$ptr" ]]; then
-      update_json ".reverse_dns" "$ip" "null"
-    else
-      update_json ".reverse_dns" "$ip" "$ptr"
-    fi
+    $verbose && print "${YELLOW}PTR for $ip${RESET}"
+    local p=""
+    p=$(dig -x "$ip" +short 2>&1)
+    p=$(escape_json_string "$p")
+    update_json '.reverse_dns' "$ip" "$p"
   done
 }
 
+
+
+
 enumerate_subdomains() {
-  local domain="$1" wordlist="$2" verbose="$3"
-  local subdomain full_domain ip
+  integer MAX_BG=200
 
-  if [[ -z "$wordlist" ]]; then
-    print "Subdomain enumeration skipped (no wordlist provided)."
-    return 0
-  fi
+  emulate -L zsh
 
-  if [[ ! -f "$wordlist" ]]; then
-    print "${RED}Error: Wordlist file not found: $wordlist${RESET}"
-    return 1
-  fi
+  local dom=$1 list=$2 verbose=$3
+  [[ -z $list ]] && { print "Sub-domain brute skipped (no wordlist)"; return; }
+  [[ -f $list ]]  || { print "${RED}Wordlist not found${RESET}"; return 1; }
 
-  if [[ "$verbose" == "true" ]]; then
-    print "${YELLOW}=== Subdomain Enumeration ===${RESET}"
-  fi
+  $verbose && print "${YELLOW}Sub-domain brute${RESET}"
 
-  while read -r subdomain; do
-    full_domain="$subdomain.$domain"
-    if [[ "$verbose" == "true" ]]; then
-      print "Testing subdomain: $full_domain"
+  local tmpdir=$(mktemp -d) || return 1
+  local job=0
+
+  while read -r sub; do
+    (( job++ ))
+    {
+      local full=$sub.$dom
+      local ip=$(dig "$full" A +short 2>&1)
+      ip=$(escape_json_string "$ip")
+      # write one line per job:  job_number<tab>full<tab>ip
+      print -r "$job"$'\t'"$full"$'\t'"$ip"
+    } >$tmpdir/$job 2>&1 &
+
+    # throttle: keep MAX_BG jobs running
+    while (( $(jobs -r | wc -l) >= MAX_BG )); do
+      sleep 0.1
+    done
+  done <"$list"
+
+  wait
+
+  local i=1
+  for ((i=1; i<=job; i++)); do
+    typeset -a line=()
+    IFS=$'\t' read -rA line < $tmpdir/$i
+    if [[ ! -z $line[3] ]]; then
+      update_json '.subdomains' "${line[2]}" "${line[3]}"
     fi
+  done
 
-    ip=$(dig "$full_domain" A +short 2>&1)
-    ip=$(escape_json_string "$ip")
-
-    if [[ -z "$ip" ]]; then
-      update_json ".subdomains" "$full_domain" "null"
-    else
-      update_json ".subdomains" "$full_domain" "$ip"
-    fi
-  done < "$wordlist"
+  rm -rf $tmpdir
 }
+
+
 
 email_security_analysis() {
-  local domain="$1" dkim_selector="$2" verbose="$3"
-  local spf dmarc_domain dmarc dkim_domain dkim
+  local dom=$1 sel=$2 verbose=$3
+  $verbose && print "${YELLOW}Email security checks${RESET}"
 
-  if [[ "$verbose" == "true" ]]; then
-    print "${YELLOW}=== Email Security Analysis (SPF, DKIM, DMARC) ===${RESET}"
-  fi
+  # SPF
+  local spf=""
+  spf=$(dig "$dom" TXT +short 2>/dev/null | grep -m1 "v=spf1")
+  JSON_DATA=$(jq --arg v "${spf//\"/}" \
+                 '.email_security.spf = ($v | if . == "" then null else . end)' <<<"$JSON_DATA")
 
-  # Check SPF
-  if [[ "$verbose" == "true" ]]; then
-    print "Checking SPF record for domain: $domain"
-  fi
-  spf=$(dig "$domain" TXT +short 2>/dev/null | grep "v=spf1" || true)
-  spf=$(escape_json_string "$spf")
-  if [[ -z "$spf" ]]; then
-    update_json ".email_security" "spf" "null"
-  else
-    update_json ".email_security" "spf" "$spf"
-  fi
+  # DMARC
+  local dmar=""
+  dmar=$(dig "_dmarc.$dom" TXT +short 2>/dev/null | grep -m1 "v=DMARC1")
+  JSON_DATA=$(jq --arg v "${dmar//\"/}" \
+                 '.email_security.dmarc = ($v | if . == "" then null else . end)' <<<"$JSON_DATA")
 
-  # Check DMARC
-  dmarc_domain="_dmarc.$domain"
-  if [[ "$verbose" == "true" ]]; then
-    print "Checking DMARC record for domain: $dmarc_domain"
-  fi
-  dmarc=$(dig "$dmarc_domain" TXT +short 2>/dev/null | grep "v=DMARC1" || true)
-  dmarc=$(escape_json_string "$dmarc")
-  if [[ -z "$dmarc" ]]; then
-    update_json ".email_security" "dmarc" "null"
-  else
-    update_json ".email_security" "dmarc" "$dmarc"
-  fi
-
-  # Check DKIM
-  if [[ -n "$dkim_selector" ]]; then
-    dkim_domain="${dkim_selector}._domainkey.$domain"
-    if [[ "$verbose" == "true" ]]; then
-      print "Checking DKIM record for selector: $dkim_selector (domain: $dkim_domain)"
-    fi
-    dkim=$(dig "$dkim_domain" TXT +short 2>&1)
-    dkim=$(escape_json_string "$dkim")
-    if [[ -z "$dkim" ]]; then
-      update_json ".email_security" "dkim_$dkim_selector" "null"
-    else
-      update_json ".email_security" "dkim_$dkim_selector" "$dkim"
-    fi
+  # DKIM
+  if [[ -n $sel ]]; then
+    local dkim=""
+    dkim=$(dig "${sel}._domainkey.$dom" TXT +short 2>&1)
+    JSON_DATA=$(jq --arg k "dkim_${sel}" --arg v "${dkim//\"/}" \
+                   '.email_security[$k] = ($v | if . == "" then null else . end)' <<<"$JSON_DATA")
   fi
 }
+
 
 generate_text_output() {
-  local json_data="$1"
-  local output=""
-  local domain=$(jq -r '.domain' <<< "$json_data")
-  local use_colors=${2:-1}  # Default to using colors (1), set to 0 to disable
 
-  colorize() {
-    local color_code="$1"
-    local text="$2"
-    [[ $use_colors -eq 1 ]] && echo -n "${color_code}${text}${RESET}" || echo -n "$text"
-  }
+  local json="$1" nocolor=${2:-0}
+  local out="" domain=""
+  domain=$(jq -r '.domain' <<<"$json")
 
-  output="${output}=== DNS Records for $domain ==="$'\n'
-  jq -r '.dns_records | to_entries[] | "\(.key): \(.value)"' <<< "$json_data" | while read -r line; do
-  output="${output}$(colorize "$YELLOW" "${line%%:*}"): ${line#*: }"$'\n'; done
+  colorize() { ((nocolor)) && print -nr -- "$2" || print -nr -- "$1$2$RESET"; }
 
+  out=$'\n\n'"=== DNS Records for $domain ==="$'\n\n'
+  while IFS= read -r l; do
+    out+=$(colorize "$YELLOW" "${l%%:*}")": ${l#*: }"$'\n\n'
+  done < <(jq -r '.dns_records|to_entries[]|"\(.key): \(.value//"null")"' <<<"$json")
 
-  output="${output}"$'\n'"=== Zone Transfer Results ==="$'\n'
-  jq -r '.zone_transfer | to_entries[] | "\(.key): \(.value)"' <<< "$json_data" | while read -r line; do
-  output="${output}${line%%:*}: ${line#*: }"$'\n';done
+  out+=$'\n\n'"=== Zone Transfer ==="$'\n'
+  while IFS= read -r l; do
+    out+="${l%%:*}: ${l#*: }"$'\n'
+  done < <(jq -r '.zone_transfer|to_entries[]|"\(.key): \(.value//"null")"' <<<"$json")
 
-  output="${output}"$'\n'"=== Reverse DNS Results ==="$'\n'
-  jq -r '.reverse_dns | to_entries[] | "\(.key): \(.value)"' <<< "$json_data" | while read -r line; do
-  output="${output}$(colorize "$YELLOW" "${line%%:*}"): ${line#*: }"$'\n';done
+  out+=$'\n\n'"=== Reverse DNS ==="$'\n'
+  while IFS= read -r l; do
+    out+=$(colorize "$YELLOW" "${l%%:*}")": ${l#*: }"$'\n'
+  done < <(jq -r '.reverse_dns|to_entries[]|"\(.key): \(.value//"null")"' <<<"$json")
 
-  if jq -e '.subdomains | length > 0' <<< "$json_data" >/dev/null; then
-    output="${output}"$'\n'"=== Subdomain Results ==="$'\n'
-    jq -r '.subdomains | to_entries[] | "\(.key): \(.value)"' <<< "$json_data" | while read -r line; do
-    output="${output}$(colorize "$YELLOW" "${line%%:*}"): ${line#*: }"$'\n';done
+  if jq -e '.subdomains|length>0' <<<"$json" &>/dev/null; then
+    out+=$'\n\n'"=== Subdomains ==="$'\n'
+    while IFS= read -r l; do
+      out+=$(colorize "$YELLOW" "${l%%:*}")": ${l#*: }"$'\n'
+    done < <(jq -r '.subdomains|to_entries[]|"\(.key): \(.value//"null")"' <<<"$json")
   fi
 
-  output="${output}"$'\n'"=== Email Security Results ==="$'\n'
-  jq -r '.email_security | to_entries[] | "\(.key): \(.value)"' <<< "$json_data" | while read -r line; do
-  output="${output}$(colorize "$YELLOW" "${line%%:*}"): ${line#*: }"$'\n'; done
+  out+=$'\n\n'"=== Email Security ==="$'\n'
+  while IFS= read -r l; do
+    out+=$(colorize "$YELLOW" "${l%%:*}")": ${l#*: }"$'\n'
+  done < <(jq -r '.email_security|to_entries[]|"\(.key): \(.value//"null")"' <<<"$json")
 
-  # Print the output (without interpretation, since we used actual newlines)
-  print -r -- "$output"
+  print -nr -- "$out"
 }
+
+
 
 
 function ooo(){
@@ -302,86 +252,57 @@ function ooo(){
 }
 
 
-
 main() {
-  local verbose=false output_file="" wordlist="" json_output=false domain="" dkim_selector=""
   local -A opts
+  local verbose=false json_out=false ofile= wlist= dom= sel=
 
   zmodload zsh/zutil
   zparseopts -D -E -A opts h v o: w: j d: k:
 
-  if (( ${+opts[-h]} )); then
-    usage
-    return 0
+  (( ${+opts[-h]} )) && { usage; return 0; }
+
+  (( ${+opts[-v]} )) && verbose=true
+
+  ofile=${opts[-o]:-}
+  wlist=${opts[-w]:-}
+  (( ${+opts[-j]} )) && json_out=true
+  dom=${opts[-d]:-}
+  sel=${opts[-k]:-}
+
+  [[ -z $dom ]] && { print -u2 -- "${RED}Domain required (-d)${RESET}"; usage; return 1; }
+
+  if ! dig "$dom" A +short &>/dev/null; then
+    print -u2 -- "${RED}Cannot resolve $dom${RESET}"; return 1
   fi
 
-  if (( ${+opts[-v]} )); then
-    verbose=true
+  if $json_out && [[ -z $ofile ]]; then
+    print -u2 -- "${RED}JSON output needs -o FILE${RESET}"; usage; return 1
   fi
 
-  output_file=${opts[-o]:-}
+  print "${WHITE}Checking DNS for $dom${RESET}"
 
-  wordlist=${opts[-w]:-}
+  $verbose && print "Verbose mode on"
 
-  if (( ${+opts[-j]} )); then
-    json_output=true
-  fi
+  init_json "$dom"
 
-  domain=${opts[-d]:-}
-  dkim_selector=${opts[-k]:-}
+  query_dns_records      "$dom" "$verbose"
+  zone_transfer_check    "$dom" "$verbose"
+  reverse_dns_lookup     "$dom" "$verbose"
+  enumerate_subdomains   "$dom" "$wlist" "$verbose"
+  email_security_analysis "$dom" "$sel"  "$verbose"
 
-  if [[ -z "$domain" ]]; then
-    print "${RED}Error: Domain is required (-d).${RESET}"
-    usage
-    return 1
-  fi
-
-  if ! dig "$domain" A +short > /dev/null 2>&1; then
-    print "${RED}Error: Unable to resolve domain '$domain'.${RESET}"
-    return 1
-  fi
-
-  if $json_output && [[ -z "$output_file" ]]; then
-    print "${RED}Error: JSON output requires an output file (-o).${RESET}"
-    usage
-    return 1
-  fi
-
-  print "${WHITE}Checking DNS records for domain: $domain${RESET}"
-  if [[ "$verbose" == "true" ]]; then
-    print "Verbose mode enabled. Detailed logs will be displayed."
-  fi
-
-  # Initialize JSON structure
-  init_json "$domain"
-
-  query_dns_records "$domain" "$verbose"
-  zone_transfer_check "$domain" "$verbose"
-  reverse_dns_lookup "$domain" "$verbose"
-  enumerate_subdomains "$domain" "$wordlist" "$verbose"
-  email_security_analysis "$domain" "$dkim_selector" "$verbose"
-
-  if $json_output; then
-    ooo
-    if [[ -n "$output_file" ]]; then
-      jq . <<< "$JSON_DATA" > "$output_file"
-      print "${GREEN}DNS records saved to $output_file in JSON format${RESET}"
-    else
-      jq . <<< "$JSON_DATA"
-    fi
+  if $json_out; then
+    jq . <<<"$JSON_DATA" > "$ofile"
+    print "${GREEN}JSON saved → $ofile${RESET}"
   else
-    ooo
-    local use_colors=1
-    [[ -n "$output_file" ]] && use_colors=0
-    output=$(generate_text_output "$JSON_DATA" "$use_colors" | sed 's/\x1B\[[0-9;]*[JKmsu]//g')
-    if [[ -n "$output_file" ]]; then
-      print -r -- "$output" > "$output_file"
-      print "${GREEN}DNS records saved to $output_file${RESET}"
-    else
-      print -r -- "$output"
-    fi
+    local use_color=1
+    [[ -n $ofile ]] && use_color=0
+    generate_text_output "$JSON_DATA" "$use_color" | sed $'s/\e\[[0-9;]*m//g' >|"${ofile:-/dev/stdout}"
+    [[ -n $ofile ]] && print "${GREEN}Text saved → $ofile${RESET}"
   fi
   rm -f "$JSON_TEMP_FILE"
 }
+
+
 
 main "$@"
