@@ -1,4 +1,4 @@
-#!/usr/bin/zsh
+#!/usr/bin/env zsh
 
 # DNS recon tool – parallel diging :)
 # dig faster u fool :))
@@ -8,7 +8,6 @@
 setopt extendedglob dotglob nullglob nounset
 trap 'kill $(jobs -rp) 2>/dev/null' EXIT INT TERM
 
-# strict mode
 set -euo pipefail
 emulate -L zsh
 
@@ -60,7 +59,6 @@ Features:
 EOF
 }
 
-# Helper to update JSON in a temp file
 function update_json_file() {
   local file="$1" p="$2" k="$3" v="$4"
   if [[ ! -f "$file" ]]; then
@@ -91,18 +89,14 @@ function run_parallel_recon(){
     local out=${outputs[i]}
     local arg=${args[i]}
 
-    # Initialize output file with empty object
     echo "{}" > "$out"
 
-    # Direct function call in background
     { $func "$dom" "$arg" "$out"; } &
 
-    # Throttle jobs
     while (( $(jobs -r | wc -l) >= jobs )); do sleep 0.2; done
   done
   wait
 
-  # Combine all JSON files into final structure
   local base_json=$(jq -n --arg domain "$dom" '{
     domain: $domain,
     dns_records: {},
@@ -112,7 +106,6 @@ function run_parallel_recon(){
     email_security: {}
   }')
 
-  # Merge each section
   if [[ -f "$tmpdir/dns.json" ]]; then
     base_json=$(jq --slurpfile dns "$tmpdir/dns.json" '.dns_records = $dns[0]' <<<"$base_json")
   fi
@@ -317,139 +310,6 @@ function generate_text_output() {
   print "$out"
 }
 
-#
-# function main() {
-#   local -A opts
-#   local json_out=false parallel_jobs=false ofile= wlist= dom= sel=
-#   typeset -g verbose=false
-#
-#   zmodload zsh/zutil
-#   zparseopts -D -E -A opts h v J o: w: j d: k:
-#
-#   (( ${+opts[-h]} )) && { usage; return 0; }
-#   (( ${+opts[-v]} )) && verbose=true
-#   ofile=${opts[-o]:-}
-#   wlist=${opts[-w]:-}
-#   (( ${+opts[-j]} )) && json_out=true
-#   dom=${opts[-d]:-}
-#   sel=${opts[-k]:-}
-#
-#   (( ${+opts[-J]} )) && parallel_jobs=true
-#
-#
-#   [[ -z $dom ]] && { print -u2 "${RED}Domain required (-d)${RESET}"; usage; return 1; }
-#   if ! dig "$dom" A +short &>/dev/null; then
-#     print -u2 "${RED}Cannot resolve $dom${RESET}"; return 1
-#   fi
-#   if $json_out && [[ -z $ofile ]]; then
-#     print -u2 "${RED}JSON output needs -o FILE${RESET}"; usage; return 1
-#   fi
-#
-#   $verbose &&  print "${WHITE}Checking DNS for $dom${RESET}"
-#   $verbose && print "Verbose mode on  (parallel jobs: $parallel_jobs)" >&2
-#
-#   local JSON_DATA="{}"
-#
-#   if $parallel_jobs; then
-#
-#     JSON_DATA=$(run_parallel_recon "$dom" "$wlist" "$sel")
-#     if $json_out; then
-#       jq . <<<"$JSON_DATA" > /dev/stdout
-#       #"$ofile"
-#       $verbose && print "${GREEN}JSON saved → $ofile${RESET}"
-#     else
-#       generate_text_output "$JSON_DATA" 0
-#     fi
-#
-#   else
-#
-#     # Sequential mode
-#     local tmpdir=$(mktemp -d)
-#     trap "rm -rf $tmpdir" EXIT
-#
-#     echo "{}" > "$tmpdir/dns.json"
-#     echo "{}" > "$tmpdir/axfr.json"
-#     echo "{}" > "$tmpdir/ptr.json"
-#     echo "{}" > "$tmpdir/subs.json"
-#     echo "{}" > "$tmpdir/mail.json"
-#
-#     query_dns_records "$dom" "" "$tmpdir/dns.json"
-#     zone_transfer_check "$dom" "" "$tmpdir/axfr.json"
-#     reverse_dns_lookup "$dom" "" "$tmpdir/ptr.json"
-#     enumerate_subdomains "$dom" "$wlist" "$tmpdir/subs.json"
-#     email_security_analysis "$dom" "$sel" "$tmpdir/mail.json"
-#
-#     JSON_DATA=$(jq -n --arg domain "$dom" '{
-#       domain: $domain,
-#       dns_records: {},
-#       zone_transfer: {},
-#       reverse_dns: {},
-#       subdomains: {},
-#       email_security: {}
-#     }')
-#
-#     JSON_DATA=$(jq --slurpfile dns "$tmpdir/dns.json" '.dns_records = $dns[0]' <<<"$JSON_DATA")
-#     JSON_DATA=$(jq --slurpfile axfr "$tmpdir/axfr.json" '.zone_transfer = $axfr[0]' <<<"$JSON_DATA")
-#     JSON_DATA=$(jq --slurpfile ptr "$tmpdir/ptr.json" '.reverse_dns = $ptr[0]' <<<"$JSON_DATA")
-#     JSON_DATA=$(jq --slurpfile subs "$tmpdir/subs.json" '.subdomains = $subs[0]' <<<"$JSON_DATA")
-#     JSON_DATA=$(jq --slurpfile mail "$tmpdir/mail.json" '.email_security = $mail[0]' <<<"$JSON_DATA")
-#
-#     if $json_out; then
-#       jq . <<<"$JSON_DATA" > /dev/stdout
-#       #"$ofile"
-#       $verbose && print "${GREEN}JSON saved → $ofile${RESET}"
-#     else
-#       generate_text_output "$JSON_DATA" 0
-#     fi
-#
-#     # Determine output behavior
-#     handle_output() {
-#       local json_data="$1"
-#
-#       if $verbose; then
-#         # VERBOSE MODE: Always show text on screen
-#         generate_text_output "$json_data" 0
-#
-#         # If JSON output requested with file, also save JSON
-#         if $json_out && [[ -n "$ofile" ]]; then
-#           jq . <<<"$json_data" > "$ofile"
-#           print "${GREEN}JSON saved → $ofile${RESET}" >&2
-#         fi
-#       else
-#         # NON-VERBOSE MODE: Normal output rules
-#         if $json_out; then
-#           # JSON output
-#           if [[ -n "$ofile" ]]; then
-#             # Save to file AND show on stdout
-#             jq . <<<"$json_data" > "$ofile"
-#             jq . <<<"$json_data"
-#             print "${GREEN}JSON saved → $ofile${RESET}" >&2
-#           else
-#             # Show JSON on stdout only
-#             jq . <<<"$json_data"
-#           fi
-#         else
-#           # Text output
-#           if [[ -n "$ofile" ]]; then
-#             # Save to file AND show on stdout
-#             generate_text_output "$json_data" 0 > "$ofile"
-#             generate_text_output "$json_data" 0
-#             print "${GREEN}Text saved → $ofile${RESET}" >&2
-#           else
-#             # Show text on stdout only
-#             generate_text_output "$json_data" 0
-#           fi
-#         fi
-#       fi
-#     }
-#
-#     # Call the output handler
-#     handle_output "$JSON_DATA"
-#
-#     rm -rf "$tmpdir"
-#   fi
-# }
-
 function main() {
   local -A opts
   local json_out=false parallel_jobs=false ofile= wlist= dom= sel=
@@ -481,36 +341,27 @@ function main() {
 
   local JSON_DATA="{}"
 
-  # Define handle_output function
   handle_output() {
     local json_data="$1"
 
     if $verbose; then
-      # VERBOSE MODE: Always show text on screen
       generate_text_output "$json_data" 0
 
-      # If JSON output requested with file, also save JSON
       if $json_out && [[ -n "$ofile" ]]; then
         jq . <<<"$json_data" > "$ofile"
         $verbose && print "${GREEN}JSON saved → $ofile${RESET}" >&2
       fi
     else
-      # NON-VERBOSE MODE: Normal output rules
       if $json_out; then
-        # JSON output
         if [[ -n "$ofile" ]]; then
-          # Save to file AND show on stdout
           jq . <<<"$json_data" > "$ofile"
           jq . <<<"$json_data"
           $verbose && print "${GREEN}JSON saved → $ofile${RESET}" >&2
         else
-          # Show JSON on stdout only
           jq . <<<"$json_data"
         fi
       else
-        # Text output
         if [[ -n "$ofile" ]]; then
-          # Save to file AND show on stdout
           generate_text_output "$json_data" 0 > "$ofile"
           generate_text_output "$json_data" 0
           $verbose && print "${GREEN}Text saved → $ofile${RESET}" >&2
