@@ -7,7 +7,7 @@
 #
 # v1.2.1 using /dev/shm instead of normal tmp dir -->
 # tmp is not tmpfs on all of systems but /dev/shm normally is :)
-#
+# change!
 
 
 setopt extendedglob dotglob nullglob nounset
