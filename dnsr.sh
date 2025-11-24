@@ -81,10 +81,6 @@ function main() {
     print -u2 "${RED}Cannot resolve $dom${RESET}"; return 1
   fi
 
-#   if $json_out && [[ -z $ofile ]]; then
-#     print -u2 "${RED}JSON output needs -o FILE${RESET}"; usage; return 1
-#   fi
-
   $verbose && print "${WHITE}Checking DNS for $dom${RESET}" >&2
   $verbose && print "Verbose mode on  (parallel jobs: $parallel_jobs)" >&2
 
@@ -111,7 +107,7 @@ function main() {
         fi
       else
         if [[ -n "$ofile" ]]; then
-          generate_text_output "$json_data" 0 > "$ofile"
+          generate_text_output "$json_data" 1 > "$ofile"
           generate_text_output "$json_data" 0
           $verbose && print "${GREEN}Text saved → $ofile${RESET}" >&2
         else
@@ -134,29 +130,39 @@ function main() {
     echo "{}" > "$tmpdir/dns.json"
     echo "{}" > "$tmpdir/axfr.json"
     echo "{}" > "$tmpdir/ptr.json"
-    echo "{}" > "$tmpdir/subs.json"
     echo "{}" > "$tmpdir/mail.json"
 
     query_dns_records "$dom" "" "$tmpdir/dns.json"
     zone_transfer_check "$dom" "" "$tmpdir/axfr.json"
     reverse_dns_lookup "$dom" "" "$tmpdir/ptr.json"
-    enumerate_subdomains "$dom" "$wlist" "$tmpdir/subs.json"
+
+    if [[ -n "$wlist" && -f "$wlist" ]]; then
+      echo "{}" > "$tmpdir/subs.json"
+      enumerate_subdomains "$dom" "$wlist" "$tmpdir/subs.json"
+    fi
+
     email_security_analysis "$dom" "$sel" "$tmpdir/mail.json"
+
 
     JSON_DATA=$(jq -n --arg domain "$dom" '{
       domain: $domain,
       dns_records: {},
       zone_transfer: {},
       reverse_dns: {},
-      subdomains: {},
       email_security: {}
     }')
+
+    if [[ -n "$wlist" && -f "$wlist" ]]; then
+      JSON_DATA=$(jq '. + {subdomains: {}}' <<<"$JSON_DATA")
+    fi
 
     JSON_DATA=$(jq --slurpfile dns "$tmpdir/dns.json" '.dns_records = $dns[0]' <<<"$JSON_DATA")
     JSON_DATA=$(jq --slurpfile axfr "$tmpdir/axfr.json" '.zone_transfer = $axfr[0]' <<<"$JSON_DATA")
     JSON_DATA=$(jq --slurpfile ptr "$tmpdir/ptr.json" '.reverse_dns = $ptr[0]' <<<"$JSON_DATA")
-    JSON_DATA=$(jq --slurpfile subs "$tmpdir/subs.json" '.subdomains = $subs[0]' <<<"$JSON_DATA")
     JSON_DATA=$(jq --slurpfile mail "$tmpdir/mail.json" '.email_security = $mail[0]' <<<"$JSON_DATA")
+    if [[ -n "$wlist" && -f "$wlist" && -f "$tmpdir/subs.json" ]]; then
+      JSON_DATA=$(jq --slurpfile subs "$tmpdir/subs.json" '.subdomains = $subs[0]' <<<"$JSON_DATA")
+    fi
 
     handle_output "$JSON_DATA"
   fi
@@ -227,13 +233,23 @@ function escape_json_string() { print -nr -- "$1"; }
 
 
 function run_parallel_recon(){
+
   local dom=$1 wlist=$2 sel=$3 jobs=50
   local tmpdir=$(create_shm_temp "parallel") || return 1
 
   # Use arrays for clarity
-  local -a funcs=(query_dns_records zone_transfer_check reverse_dns_lookup enumerate_subdomains email_security_analysis)
-  local -a outputs=("$tmpdir/dns.json" "$tmpdir/axfr.json" "$tmpdir/ptr.json" "$tmpdir/subs.json" "$tmpdir/mail.json")
-  local -a args=("" "" "" "$wlist" "$sel")
+  local -a funcs=(query_dns_records zone_transfer_check reverse_dns_lookup email_security_analysis)
+  local -a outputs=("$tmpdir/dns.json" "$tmpdir/axfr.json" "$tmpdir/ptr.json" "$tmpdir/mail.json")
+  local -a args=("" "" "" "$sel")
+
+
+  # Only add subdomain enumeration if wordlist is provided!
+  if [[ -n "$wlist" && -f "$wlist" ]]; then
+    funcs+=(enumerate_subdomains)
+    outputs+=("$tmpdir/subs.json")
+    args+=("$wlist")
+  fi
+
 
   for ((i=1; i<=${#funcs[@]}; i++)); do
     local func=${funcs[i]}
@@ -253,9 +269,12 @@ function run_parallel_recon(){
     dns_records: {},
     zone_transfer: {},
     reverse_dns: {},
-    subdomains: {},
     email_security: {}
   }')
+  if [[ -n "$wlist" && -f "$wlist" ]]; then
+    base_json=$(jq '. + {subdomains: {}}' <<<"$base_json")
+  fi
+
 
   if [[ -f "$tmpdir/dns.json" ]]; then
     base_json=$(jq --slurpfile dns "$tmpdir/dns.json" '.dns_records = $dns[0]' <<<"$base_json")
@@ -266,12 +285,13 @@ function run_parallel_recon(){
   if [[ -f "$tmpdir/ptr.json" ]]; then
     base_json=$(jq --slurpfile ptr "$tmpdir/ptr.json" '.reverse_dns = $ptr[0]' <<<"$base_json")
   fi
-  if [[ -f "$tmpdir/subs.json" ]]; then
-    base_json=$(jq --slurpfile subs "$tmpdir/subs.json" '.subdomains = $subs[0]' <<<"$base_json")
-  fi
   if [[ -f "$tmpdir/mail.json" ]]; then
     base_json=$(jq --slurpfile mail "$tmpdir/mail.json" '.email_security = $mail[0]' <<<"$base_json")
   fi
+  if [[ -n "$wlist" && -f "$wlist" && -f "$tmpdir/subs.json" ]]; then
+    base_json=$(jq --slurpfile subs "$tmpdir/subs.json" '.subdomains = $subs[0]' <<<"$base_json")
+  fi
+
 
   escape_json_string "$base_json"
 }
@@ -364,7 +384,7 @@ function enumerate_subdomains() {
 
   local dom=$1 list=$2 output_file="$3"
 
-  $verbose && [[ -z $list ]] && { print "Sub-domain brute skipped (no wordlist)" >&2; return; }
+  [[ -z $list ]] && { print "Sub-domain brute skipped (no wordlist)" >&2; return; }
   [[ -f $list ]]  || { print "${RED}Wordlist not found${RESET}" >&2; return 1; }
   $verbose && print "${YELLOW}Sub-domain brute${RESET}" >&2
 
