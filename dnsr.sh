@@ -4,17 +4,166 @@
 # dig faster u fool :))
 # Author: https://github.com/a-mashhoor
 # under MIT LICENCE
+#
+# v1.2.1 using /dev/shm instead of normal tmp dir -->
+# tmp is not tmpfs on all of systems but /dev/shm normally is :)
+#
+
 
 setopt extendedglob dotglob nullglob nounset
-trap 'kill $(jobs -rp) 2>/dev/null' EXIT INT TERM
+trap 'kill $(jobs -rp) 2>/dev/null; clean_shm' EXIT INT TERM
 
 set -euo pipefail
 emulate -L zsh
 
+# duckin' deps!
 command -v jq   &>/dev/null || { print -u2 "Err: jq required";   exit 1; }
 command -v dig  &>/dev/null || { print -u2 "Err: dig required";  exit 1; }
 
+
+# needed globals - discusting, I know but we need them for DRY
+# I hate spaggaty code even more than freaking globals, thus here they are
+typeset -g SHMB="" # shared memory base
+typeset -g verbose=false
 WHITE="\e[1;37m"; RED="\e[1;31m"; GREEN="\e[1;32m"; YELLOW="\e[1;33m"; RESET="\e[0m"
+
+
+function setup_shm() {
+    # we need more uniqueness than $$ otherwise we might cause race condtions
+    SHMB="/dev/shm/dnsr_$(date +%s)_${RANDOM}_$$"
+    if ! mkdir -p "$SHMB" 2>/dev/null; then
+        $verbose && print -u2 "${YELLOW}Warning: /dev/shm not available, using /tmp${RESET}"
+        SHMB=$(mktemp -d)
+    else
+        $verbose && print -u2 "${GREEN}Using shared memory: $SHMB${RESET}" >&2
+    fi
+}
+
+
+function clean_shm() {
+    if [[ -n "$SHMB" && -d "$SHMB" ]]; then
+        rm -rf "$SHMB" 2>/dev/null && \
+        $verbose && print -u2 "${GREEN}Cleaned up shared memory${RESET}" >&2
+    fi
+}
+
+function create_shm_temp() {
+    local prefix="${1:-temp}"
+    local temp_dir="$SHMB/${prefix}_${RANDOM}_${RANDOM}"
+    mkdir -p "$temp_dir" || return 1
+    print -r -- "$temp_dir"
+}
+
+
+# The freaking driver :)
+function main() {
+  local -A opts
+  local json_out=false parallel_jobs=false ofile= wlist= dom= sel=
+
+  zmodload zsh/zutil
+  zparseopts -D -E -A opts h v J o: w: j d: k:
+
+  setup_shm
+
+  (( ${+opts[-h]} )) && { usage; return 0; }
+  (( ${+opts[-v]} )) && verbose=true
+  ofile=${opts[-o]:-}
+  wlist=${opts[-w]:-}
+  (( ${+opts[-j]} )) && json_out=true
+  dom=${opts[-d]:-}
+  sel=${opts[-k]:-}
+
+  (( ${+opts[-J]} )) && parallel_jobs=true
+
+  [[ -z $dom ]] && { print -u2 "${RED}Domain required (-d)${RESET}"; usage; return 1; }
+
+  if ! dig "$dom" A +short &>/dev/null; then
+    print -u2 "${RED}Cannot resolve $dom${RESET}"; return 1
+  fi
+
+#   if $json_out && [[ -z $ofile ]]; then
+#     print -u2 "${RED}JSON output needs -o FILE${RESET}"; usage; return 1
+#   fi
+
+  $verbose && print "${WHITE}Checking DNS for $dom${RESET}" >&2
+  $verbose && print "Verbose mode on  (parallel jobs: $parallel_jobs)" >&2
+
+  local JSON_DATA="{}"
+
+  handle_output() {
+    local json_data="$1"
+
+    if $verbose; then
+      generate_text_output "$json_data" 0
+
+      if $json_out && [[ -n "$ofile" ]]; then
+        jq . <<<"$json_data" > "$ofile"
+        $verbose && print "${GREEN}JSON saved → $ofile${RESET}" >&2
+      fi
+    else
+      if $json_out; then
+        if [[ -n "$ofile" ]]; then
+          jq . <<<"$json_data" > "$ofile"
+          jq . <<<"$json_data"
+          $verbose && print "${GREEN}JSON saved → $ofile${RESET}" >&2
+        else
+          jq . <<<"$json_data"
+        fi
+      else
+        if [[ -n "$ofile" ]]; then
+          generate_text_output "$json_data" 0 > "$ofile"
+          generate_text_output "$json_data" 0
+          $verbose && print "${GREEN}Text saved → $ofile${RESET}" >&2
+        else
+          # Show text on stdout only
+          generate_text_output "$json_data" 0
+        fi
+      fi
+    fi
+  }
+
+  if $parallel_jobs; then
+    # Parallel mode
+    JSON_DATA=$(run_parallel_recon "$dom" "$wlist" "$sel")
+    handle_output "$JSON_DATA"
+  else
+    # Sequential mode
+    local tmpdir=$(create_shm_temp "sequential") || return 1
+    trap "rm -rf $tmpdir" EXIT
+
+    echo "{}" > "$tmpdir/dns.json"
+    echo "{}" > "$tmpdir/axfr.json"
+    echo "{}" > "$tmpdir/ptr.json"
+    echo "{}" > "$tmpdir/subs.json"
+    echo "{}" > "$tmpdir/mail.json"
+
+    query_dns_records "$dom" "" "$tmpdir/dns.json"
+    zone_transfer_check "$dom" "" "$tmpdir/axfr.json"
+    reverse_dns_lookup "$dom" "" "$tmpdir/ptr.json"
+    enumerate_subdomains "$dom" "$wlist" "$tmpdir/subs.json"
+    email_security_analysis "$dom" "$sel" "$tmpdir/mail.json"
+
+    JSON_DATA=$(jq -n --arg domain "$dom" '{
+      domain: $domain,
+      dns_records: {},
+      zone_transfer: {},
+      reverse_dns: {},
+      subdomains: {},
+      email_security: {}
+    }')
+
+    JSON_DATA=$(jq --slurpfile dns "$tmpdir/dns.json" '.dns_records = $dns[0]' <<<"$JSON_DATA")
+    JSON_DATA=$(jq --slurpfile axfr "$tmpdir/axfr.json" '.zone_transfer = $axfr[0]' <<<"$JSON_DATA")
+    JSON_DATA=$(jq --slurpfile ptr "$tmpdir/ptr.json" '.reverse_dns = $ptr[0]' <<<"$JSON_DATA")
+    JSON_DATA=$(jq --slurpfile subs "$tmpdir/subs.json" '.subdomains = $subs[0]' <<<"$JSON_DATA")
+    JSON_DATA=$(jq --slurpfile mail "$tmpdir/mail.json" '.email_security = $mail[0]' <<<"$JSON_DATA")
+
+    handle_output "$JSON_DATA"
+  fi
+}
+
+
+
 
 function usage() {
   cat <<EOF
@@ -59,6 +208,7 @@ Features:
 EOF
 }
 
+
 function update_json_file() {
   local file="$1" p="$2" k="$3" v="$4"
   if [[ ! -f "$file" ]]; then
@@ -72,12 +222,13 @@ function update_json_file() {
   fi
 }
 
+
 function escape_json_string() { print -nr -- "$1"; }
+
 
 function run_parallel_recon(){
   local dom=$1 wlist=$2 sel=$3 jobs=50
-  local tmpdir=$(mktemp -d) || return 1
-  trap "rm -rf $tmpdir" EXIT INT TERM
+  local tmpdir=$(create_shm_temp "parallel") || return 1
 
   # Use arrays for clarity
   local -a funcs=(query_dns_records zone_transfer_check reverse_dns_lookup enumerate_subdomains email_security_analysis)
@@ -129,8 +280,7 @@ function run_parallel_recon(){
 function query_dns_records() {
   local dom=$1 arg=$2 output_file="$3"
   local -a rtps=(A AAAA CNAME MX TXT NS SOA SRV PTR CAA RP HINFO LOC NAPTR TLSA DNAME)
-
-  local tmpdir=$(mktemp -d) || return 1
+  local tmpdir=$(create_shm_temp "dns") || return 1
   integer BG=16 job=0
 
   # wildcard first (serial – only one query)
@@ -214,11 +364,11 @@ function enumerate_subdomains() {
 
   local dom=$1 list=$2 output_file="$3"
 
-  [[ -z $list ]] && { print "Sub-domain brute skipped (no wordlist)" >&2; return; }
+  $verbose && [[ -z $list ]] && { print "Sub-domain brute skipped (no wordlist)" >&2; return; }
   [[ -f $list ]]  || { print "${RED}Wordlist not found${RESET}" >&2; return 1; }
   $verbose && print "${YELLOW}Sub-domain brute${RESET}" >&2
 
-  local tmpdir=$(mktemp -d) || return 1
+  local tmpdir=$(create_shm_temp "subs") || return 1
   local job=0
 
   while read -r sub; do
@@ -308,110 +458,6 @@ function generate_text_output() {
   done < <(jq -r '.email_security|to_entries[]|"\(.key): \(.value//"null")"' <<<"$json")
 
   print "$out"
-}
-
-function main() {
-  local -A opts
-  local json_out=false parallel_jobs=false ofile= wlist= dom= sel=
-  typeset -g verbose=false
-
-  zmodload zsh/zutil
-  zparseopts -D -E -A opts h v J o: w: j d: k:
-
-  (( ${+opts[-h]} )) && { usage; return 0; }
-  (( ${+opts[-v]} )) && verbose=true
-  ofile=${opts[-o]:-}
-  wlist=${opts[-w]:-}
-  (( ${+opts[-j]} )) && json_out=true
-  dom=${opts[-d]:-}
-  sel=${opts[-k]:-}
-
-  (( ${+opts[-J]} )) && parallel_jobs=true
-
-  [[ -z $dom ]] && { print -u2 "${RED}Domain required (-d)${RESET}"; usage; return 1; }
-  if ! dig "$dom" A +short &>/dev/null; then
-    print -u2 "${RED}Cannot resolve $dom${RESET}"; return 1
-  fi
-  if $json_out && [[ -z $ofile ]]; then
-    print -u2 "${RED}JSON output needs -o FILE${RESET}"; usage; return 1
-  fi
-
-  $verbose && print "${WHITE}Checking DNS for $dom${RESET}" >&2
-  $verbose && print "Verbose mode on  (parallel jobs: $parallel_jobs)" >&2
-
-  local JSON_DATA="{}"
-
-  handle_output() {
-    local json_data="$1"
-
-    if $verbose; then
-      generate_text_output "$json_data" 0
-
-      if $json_out && [[ -n "$ofile" ]]; then
-        jq . <<<"$json_data" > "$ofile"
-        $verbose && print "${GREEN}JSON saved → $ofile${RESET}" >&2
-      fi
-    else
-      if $json_out; then
-        if [[ -n "$ofile" ]]; then
-          jq . <<<"$json_data" > "$ofile"
-          jq . <<<"$json_data"
-          $verbose && print "${GREEN}JSON saved → $ofile${RESET}" >&2
-        else
-          jq . <<<"$json_data"
-        fi
-      else
-        if [[ -n "$ofile" ]]; then
-          generate_text_output "$json_data" 0 > "$ofile"
-          generate_text_output "$json_data" 0
-          $verbose && print "${GREEN}Text saved → $ofile${RESET}" >&2
-        else
-          # Show text on stdout only
-          generate_text_output "$json_data" 0
-        fi
-      fi
-    fi
-  }
-
-  if $parallel_jobs; then
-    # Parallel mode
-    JSON_DATA=$(run_parallel_recon "$dom" "$wlist" "$sel")
-    handle_output "$JSON_DATA"
-  else
-    # Sequential mode
-    local tmpdir=$(mktemp -d)
-    trap "rm -rf $tmpdir" EXIT
-
-    echo "{}" > "$tmpdir/dns.json"
-    echo "{}" > "$tmpdir/axfr.json"
-    echo "{}" > "$tmpdir/ptr.json"
-    echo "{}" > "$tmpdir/subs.json"
-    echo "{}" > "$tmpdir/mail.json"
-
-    query_dns_records "$dom" "" "$tmpdir/dns.json"
-    zone_transfer_check "$dom" "" "$tmpdir/axfr.json"
-    reverse_dns_lookup "$dom" "" "$tmpdir/ptr.json"
-    enumerate_subdomains "$dom" "$wlist" "$tmpdir/subs.json"
-    email_security_analysis "$dom" "$sel" "$tmpdir/mail.json"
-
-    JSON_DATA=$(jq -n --arg domain "$dom" '{
-      domain: $domain,
-      dns_records: {},
-      zone_transfer: {},
-      reverse_dns: {},
-      subdomains: {},
-      email_security: {}
-    }')
-
-    JSON_DATA=$(jq --slurpfile dns "$tmpdir/dns.json" '.dns_records = $dns[0]' <<<"$JSON_DATA")
-    JSON_DATA=$(jq --slurpfile axfr "$tmpdir/axfr.json" '.zone_transfer = $axfr[0]' <<<"$JSON_DATA")
-    JSON_DATA=$(jq --slurpfile ptr "$tmpdir/ptr.json" '.reverse_dns = $ptr[0]' <<<"$JSON_DATA")
-    JSON_DATA=$(jq --slurpfile subs "$tmpdir/subs.json" '.subdomains = $subs[0]' <<<"$JSON_DATA")
-    JSON_DATA=$(jq --slurpfile mail "$tmpdir/mail.json" '.email_security = $mail[0]' <<<"$JSON_DATA")
-
-    handle_output "$JSON_DATA"
-    rm -rf "$tmpdir"
-  fi
 }
 
 
